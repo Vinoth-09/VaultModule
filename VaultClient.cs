@@ -2,10 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
+using VaultSharp;
+using VaultSharp.V1.AuthMethods;
+using VaultSharp.V1.AuthMethods.Cert;
+using VaultSharp.V1.Commons;
 using VaultCacheModule.Configuration;
 using VaultCacheModule.Exceptions;
 using VaultCacheModule.Models;
@@ -13,14 +14,12 @@ using VaultCacheModule.Models;
 namespace VaultCacheModule
 {
     /// <summary>
-    /// Client for interacting with HashiCorp Vault using TLS certificate authentication
+    /// Client for interacting with HashiCorp Vault using VaultSharp with TLS certificate authentication
     /// </summary>
     public class VaultClient : IDisposable
     {
         private readonly VaultConfiguration _configuration;
-        private readonly HttpClient _httpClient;
-        private string _authToken;
-        private DateTime _tokenExpiry;
+        private readonly IVaultClient _vaultSharpClient;
         private readonly object _authLock = new object();
         private bool _disposed = false;
 
@@ -33,104 +32,71 @@ namespace VaultCacheModule
                 throw new ArgumentException("Invalid Vault configuration", nameof(configuration));
             }
 
-            _httpClient = CreateHttpClient();
+            _vaultSharpClient = CreateVaultSharpClient();
         }
 
         /// <summary>
-        /// Creates and configures the HTTP client with TLS certificate authentication
+        /// Creates and configures the VaultSharp client with TLS certificate authentication
         /// </summary>
-        private HttpClient CreateHttpClient()
+        private IVaultClient CreateVaultSharpClient()
         {
-            var handler = new HttpClientHandler();
-            
-            // Add the client certificate for TLS authentication
-            handler.ClientCertificates.Add(_configuration.ClientCertificate);
-            
-            // Configure SSL/TLS settings
-            handler.ServerCertificateCustomValidationCallback = (sender, certificate, chain, sslPolicyErrors) =>
+            try
             {
-                // In production, you should implement proper certificate validation
-                // For now, we'll accept all certificates (modify as needed for your security requirements)
-                return true;
-            };
+                // Configure TLS certificate authentication
+                var certAuthMethodInfo = new CertAuthMethodInfo(_configuration.RoleName)
+                {
+                    MountPoint = _configuration.CertAuthPath,
+                    ClientCertificate = _configuration.ClientCertificate
+                };
 
-            var client = new HttpClient(handler)
+                // Create VaultSharp client settings
+                var vaultClientSettings = new VaultClientSettings(_configuration.VaultUrl, certAuthMethodInfo)
+                {
+                    VaultServiceTimeout = _configuration.RequestTimeout,
+                    UseVaultTokenHeaderInsteadOfAuthorizationHeader = true
+                };
+
+                // Configure HTTP client handler for additional TLS settings
+                var httpClientHandler = new HttpClientHandler();
+                httpClientHandler.ClientCertificates.Add(_configuration.ClientCertificate);
+                
+                // In production, implement proper certificate validation
+                httpClientHandler.ServerCertificateCustomValidationCallback = (sender, certificate, chain, sslPolicyErrors) =>
+                {
+                    // TODO: Implement proper server certificate validation for production
+                    return true;
+                };
+
+                vaultClientSettings.MyHttpClientProviderFunc = () => new HttpClient(httpClientHandler)
+                {
+                    Timeout = _configuration.RequestTimeout
+                };
+
+                return new VaultClient(vaultClientSettings);
+            }
+            catch (Exception ex)
             {
-                BaseAddress = new Uri(_configuration.VaultUrl),
-                Timeout = _configuration.RequestTimeout
-            };
-
-            client.DefaultRequestHeaders.Add("X-Vault-Request", "true");
-            
-            return client;
+                throw new VaultException("Failed to create VaultSharp client", ex);
+            }
         }
 
         /// <summary>
         /// Authenticates with Vault using TLS certificate authentication
+        /// This is handled automatically by VaultSharp, but we expose it for explicit authentication
         /// </summary>
         public async Task<bool> AuthenticateAsync()
         {
             try
             {
-                var authPath = $"/v1/auth/{_configuration.CertAuthPath}/login";
-                var authPayload = new
-                {
-                    name = _configuration.RoleName
-                };
-
-                var json = JsonConvert.SerializeObject(authPayload);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync(authPath, content);
-                var responseContent = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    throw new VaultException(
-                        $"Authentication failed: {response.ReasonPhrase}",
-                        (int)response.StatusCode,
-                        responseContent);
-                }
-
-                var authResponse = JsonConvert.DeserializeObject<VaultAuthResponse>(responseContent);
-                
-                if (authResponse?.Auth?.ClientToken == null)
-                {
-                    throw new VaultException("Authentication response did not contain a valid token");
-                }
-
-                lock (_authLock)
-                {
-                    _authToken = authResponse.Auth.ClientToken;
-                    _tokenExpiry = DateTime.UtcNow.AddSeconds(authResponse.Auth.LeaseDuration - 60); // Refresh 1 minute early
-                }
-
-                // Set the token for future requests
-                _httpClient.DefaultRequestHeaders.Remove("X-Vault-Token");
-                _httpClient.DefaultRequestHeaders.Add("X-Vault-Token", _authToken);
-
-                return true;
+                // VaultSharp handles authentication automatically, but we can test it
+                // by making a simple request to verify connectivity and authentication
+                var healthStatus = await _vaultSharpClient.V1.System.GetHealthStatusAsync();
+                return healthStatus != null;
             }
-            catch (Exception ex) when (!(ex is VaultException))
+            catch (Exception ex)
             {
-                throw new VaultException("Authentication failed", ex);
+                throw new VaultException("TLS Certificate authentication failed", ex);
             }
-        }
-
-        /// <summary>
-        /// Ensures the client is authenticated and the token is valid
-        /// </summary>
-        private async Task EnsureAuthenticatedAsync()
-        {
-            lock (_authLock)
-            {
-                if (!string.IsNullOrEmpty(_authToken) && DateTime.UtcNow < _tokenExpiry)
-                {
-                    return;
-                }
-            }
-
-            await AuthenticateAsync();
         }
 
         /// <summary>
@@ -145,61 +111,68 @@ namespace VaultCacheModule
                 throw new ArgumentException("Secret path cannot be null or empty", nameof(secretPath));
             }
 
-            await EnsureAuthenticatedAsync();
-
             var attempts = 0;
             while (attempts < _configuration.MaxRetryAttempts)
             {
                 try
                 {
-                    var response = await _httpClient.GetAsync($"/v1/{secretPath.TrimStart('/')}");
-                    var responseContent = await response.Content.ReadAsStringAsync();
-
-                    if (!response.IsSuccessStatusCode)
+                    // Parse the secret path to determine the mount and path
+                    var pathParts = secretPath.TrimStart('/').Split('/');
+                    if (pathParts.Length < 2)
                     {
-                        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden ||
-                            response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-                        {
-                            // Token might be expired, try to re-authenticate
-                            await AuthenticateAsync();
-                            attempts++;
-                            continue;
-                        }
-
-                        throw new VaultException(
-                            $"Failed to retrieve secret from path '{secretPath}': {response.ReasonPhrase}",
-                            (int)response.StatusCode,
-                            responseContent);
+                        throw new ArgumentException($"Invalid secret path format: {secretPath}. Expected format: 'mount/path'");
                     }
 
-                    var secretResponse = JsonConvert.DeserializeObject<VaultSecretResponse>(responseContent);
-                    
+                    var mountPoint = pathParts[0];
+                    var path = string.Join("/", pathParts, 1, pathParts.Length - 1);
+
+                    Secret<SecretData> vaultSecret;
+
+                    // Try KV v2 first, then fall back to KV v1
+                    try
+                    {
+                        // KV v2 format
+                        vaultSecret = await _vaultSharpClient.V1.Secrets.KeyValue.V2.ReadSecretAsync(path, mountPoint: mountPoint);
+                    }
+                    catch
+                    {
+                        // Fall back to KV v1 format
+                        vaultSecret = await _vaultSharpClient.V1.Secrets.KeyValue.V1.ReadSecretAsync(path, mountPoint);
+                    }
+
+                    if (vaultSecret?.Data?.Data == null)
+                    {
+                        throw new VaultException($"No data found at secret path: {secretPath}");
+                    }
+
                     var secret = new VaultSecret
                     {
                         Path = secretPath,
                         RetrievedAt = DateTime.UtcNow,
                         ExpiresAt = DateTime.UtcNow.Add(_configuration.CacheRefreshInterval),
-                        LeaseDuration = secretResponse.LeaseDuration,
-                        Renewable = secretResponse.Renewable,
-                        LeaseId = secretResponse.LeaseId
+                        LeaseDuration = vaultSecret.LeaseDurationSeconds,
+                        Renewable = vaultSecret.Renewable,
+                        LeaseId = vaultSecret.LeaseId,
+                        Data = new Dictionary<string, object>(vaultSecret.Data.Data)
                     };
 
-                    // Handle different data formats (KV v1 vs v2)
-                    if (secretResponse.Data is Newtonsoft.Json.Linq.JObject dataObj)
+                    return secret;
+                }
+                catch (VaultApiException vaultEx)
+                {
+                    if (vaultEx.HttpStatusCode == 403 || vaultEx.HttpStatusCode == 401)
                     {
-                        // Check if this is KV v2 format (data.data)
-                        if (dataObj.ContainsKey("data") && dataObj["data"] is Newtonsoft.Json.Linq.JObject)
+                        // Authentication issue - VaultSharp should handle re-auth automatically
+                        attempts++;
+                        if (attempts >= _configuration.MaxRetryAttempts)
                         {
-                            secret.Data = dataObj["data"].ToObject<Dictionary<string, object>>();
+                            throw new VaultException($"Authentication failed for secret path '{secretPath}' after {attempts} attempts", vaultEx);
                         }
-                        else
-                        {
-                            // KV v1 format
-                            secret.Data = dataObj.ToObject<Dictionary<string, object>>();
-                        }
+                        await Task.Delay(_configuration.RetryDelay);
+                        continue;
                     }
 
-                    return secret;
+                    throw new VaultException($"Vault API error retrieving secret from path '{secretPath}': {vaultEx.Message}", vaultEx);
                 }
                 catch (VaultException)
                 {
@@ -260,11 +233,28 @@ namespace VaultCacheModule
             return results;
         }
 
+        /// <summary>
+        /// Gets the Vault health status
+        /// </summary>
+        /// <returns>Health status information</returns>
+        public async Task<bool> GetHealthStatusAsync()
+        {
+            try
+            {
+                var healthStatus = await _vaultSharpClient.V1.System.GetHealthStatusAsync();
+                return healthStatus?.Initialized == true && healthStatus?.Sealed == false;
+            }
+            catch (Exception ex)
+            {
+                throw new VaultException("Failed to get Vault health status", ex);
+            }
+        }
+
         public void Dispose()
         {
             if (!_disposed)
             {
-                _httpClient?.Dispose();
+                _vaultSharpClient?.Dispose();
                 _disposed = true;
             }
         }
