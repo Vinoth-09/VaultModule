@@ -14,7 +14,7 @@ using Timer = System.Timers.Timer;
 namespace VaultCacheModule
 {
     /// <summary>
-    /// Singleton cache for HashiCorp Vault secrets that works across multiple app domains
+    /// Singleton cache for HashiCorp Vault secrets that works across multiple app domains using MemoryCache
     /// </summary>
     public sealed class VaultSecretCache : MarshalByRefObject, IVaultSecretCache, IDisposable
     {
@@ -23,11 +23,14 @@ namespace VaultCacheModule
         private static VaultConfiguration _configuration;
         private static VaultClient _vaultClient;
 
-        private readonly ConcurrentDictionary<string, VaultSecret> _secretCache;
+        private readonly MemoryCache _memoryCache;
         private readonly ConcurrentDictionary<string, bool> _secretPaths;
         private readonly Timer _refreshTimer;
         private readonly object _refreshLock = new object();
         private bool _disposed = false;
+
+        // Cache key prefix to avoid conflicts
+        private const string SECRET_KEY_PREFIX = "vault_secret_";
 
         public DateTime? LastRefreshTime { get; private set; }
         public DateTime? NextRefreshTime { get; private set; }
@@ -40,7 +43,7 @@ namespace VaultCacheModule
         /// </summary>
         private VaultSecretCache()
         {
-            _secretCache = new ConcurrentDictionary<string, VaultSecret>();
+            _memoryCache = new MemoryCache("VaultSecretCache");
             _secretPaths = new ConcurrentDictionary<string, bool>();
             
             // Set up the refresh timer
@@ -129,10 +132,11 @@ namespace VaultCacheModule
                 return null;
             }
 
-            _secretCache.TryGetValue(secretPath, out var secret);
+            var cacheKey = GetSecretCacheKey(secretPath);
+            var secret = _memoryCache.Get(cacheKey) as VaultSecret;
             
-            // Check if the secret has expired
-            if (secret != null && secret.IsExpired())
+            // If secret is not in cache or has expired, try to refresh it
+            if (secret == null || secret.IsExpired())
             {
                 // Try to refresh the secret asynchronously (fire and forget)
                 Task.Run(async () =>
@@ -146,6 +150,9 @@ namespace VaultCacheModule
                         OnRefreshError(secretPath, ex);
                     }
                 });
+                
+                // Return the expired secret if we have one, or null if not
+                return secret;
             }
 
             return secret;
@@ -165,7 +172,19 @@ namespace VaultCacheModule
         /// </summary>
         public Dictionary<string, VaultSecret> GetAllSecrets()
         {
-            return new Dictionary<string, VaultSecret>(_secretCache);
+            var secrets = new Dictionary<string, VaultSecret>();
+            
+            foreach (var secretPath in _secretPaths.Keys)
+            {
+                var cacheKey = GetSecretCacheKey(secretPath);
+                var secret = _memoryCache.Get(cacheKey) as VaultSecret;
+                if (secret != null)
+                {
+                    secrets[secretPath] = secret;
+                }
+            }
+            
+            return secrets;
         }
 
         /// <summary>
@@ -181,7 +200,17 @@ namespace VaultCacheModule
             try
             {
                 var secret = await _vaultClient.GetSecretAsync(secretPath);
-                _secretCache.AddOrUpdate(secretPath, secret, (key, oldValue) => secret);
+                var cacheKey = GetSecretCacheKey(secretPath);
+                
+                // Create cache policy with proper expiration
+                var cachePolicy = new CacheItemPolicy
+                {
+                    AbsoluteExpiration = secret.ExpiresAt,
+                    Priority = CacheItemPriority.High,
+                    RemovedCallback = OnSecretRemovedFromCache
+                };
+                
+                _memoryCache.Set(cacheKey, secret, cachePolicy);
             }
             catch (Exception ex)
             {
@@ -210,7 +239,6 @@ namespace VaultCacheModule
             }
 
             var refreshedPaths = new List<string>();
-            var errors = new List<Exception>();
 
             try
             {
@@ -218,7 +246,18 @@ namespace VaultCacheModule
                 
                 foreach (var kvp in secrets)
                 {
-                    _secretCache.AddOrUpdate(kvp.Key, kvp.Value, (key, oldValue) => kvp.Value);
+                    var cacheKey = GetSecretCacheKey(kvp.Key);
+                    var secret = kvp.Value;
+                    
+                    // Create cache policy with proper expiration
+                    var cachePolicy = new CacheItemPolicy
+                    {
+                        AbsoluteExpiration = secret.ExpiresAt,
+                        Priority = CacheItemPriority.High,
+                        RemovedCallback = OnSecretRemovedFromCache
+                    };
+                    
+                    _memoryCache.Set(cacheKey, secret, cachePolicy);
                     refreshedPaths.Add(kvp.Key);
                 }
 
@@ -259,7 +298,11 @@ namespace VaultCacheModule
             }
 
             _secretPaths.TryRemove(secretPath, out _);
-            return _secretCache.TryRemove(secretPath, out _);
+            
+            var cacheKey = GetSecretCacheKey(secretPath);
+            var removed = _memoryCache.Remove(cacheKey);
+            
+            return removed != null;
         }
 
         /// <summary>
@@ -275,6 +318,52 @@ namespace VaultCacheModule
             {
                 OnRefreshError(null, ex);
             }
+        }
+
+        /// <summary>
+        /// Callback when a secret is removed from cache (due to expiration or eviction)
+        /// </summary>
+        private void OnSecretRemovedFromCache(CacheEntryRemovedArguments arguments)
+        {
+            if (arguments.RemovedReason == CacheEntryRemovedReason.Expired)
+            {
+                // Secret expired - extract the secret path from cache key
+                var secretPath = GetSecretPathFromCacheKey(arguments.CacheItem.Key);
+                
+                // Optionally trigger background refresh for expired secrets if they're still tracked
+                if (!string.IsNullOrEmpty(secretPath) && _secretPaths.ContainsKey(secretPath))
+                {
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await RefreshSecretAsync(secretPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            OnRefreshError(secretPath, ex);
+                        }
+                    });
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generates cache key for a secret path
+        /// </summary>
+        private string GetSecretCacheKey(string secretPath)
+        {
+            return SECRET_KEY_PREFIX + secretPath;
+        }
+
+        /// <summary>
+        /// Extracts secret path from cache key
+        /// </summary>
+        private string GetSecretPathFromCacheKey(string cacheKey)
+        {
+            return cacheKey?.StartsWith(SECRET_KEY_PREFIX) == true 
+                ? cacheKey.Substring(SECRET_KEY_PREFIX.Length) 
+                : null;
         }
 
         /// <summary>
@@ -312,6 +401,7 @@ namespace VaultCacheModule
             {
                 _refreshTimer?.Stop();
                 _refreshTimer?.Dispose();
+                _memoryCache?.Dispose();
                 _vaultClient?.Dispose();
                 _disposed = true;
             }
